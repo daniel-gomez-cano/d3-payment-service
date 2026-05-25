@@ -35,6 +35,9 @@ public class SecurityConfig {
                 // Webhook de MercadoPago: no lleva JWT de Keycloak.
                 // La seguridad del webhook se valida con la firma HMAC (x-signature) en WebhookController.
                 .requestMatchers("/api/payments/webhook/**").permitAll()
+                // Endpoint temporal de prueba — sin JWT para abrir directo en navegador
+                // ELIMINAR antes de desplegar en producción
+                .requestMatchers("/sandbox/**").permitAll()
                 // Todo lo demás requiere JWT de Keycloak
                 .anyRequest().authenticated()
             )
