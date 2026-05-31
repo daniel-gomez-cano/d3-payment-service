@@ -32,7 +32,7 @@ $ curl -s -X POST http://localhost:8084/api/payments/webhook/mercadopago   -H "C
 HTTP Status: 200
 ```
 # ¿qué significa?
-Servicio prende sin bugs, se trata de conectar mediante los ednpoints con mercado pago (falla porque falta impl en order-service), pero muestra un 503 en vez de 500, es decir que está controlado, no hay bugs y funciona el código, el status con un webhook simulado es 200, un error controlado también que indica que funciona.
+Servicio prende sin bugs, se trata de conectar mediante los endpoints con mercado pago (falla porque falta impl en order-service), pero muestra un 503 en vez de 500, es decir que está controlado, no hay bugs y funciona el código, el status con un webhook simulado es 200, un error controlado también que indica que funciona.
 
 # payment-service — VivaEventos
 
