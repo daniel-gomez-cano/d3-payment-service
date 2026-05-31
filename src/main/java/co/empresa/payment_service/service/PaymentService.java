@@ -450,10 +450,11 @@ public class PaymentService {
                 .orElseThrow(() -> new ResponseStatusException(HttpStatus.NOT_FOUND,
                         "Pago no encontrado"));
 
-        // Solo el dueño del pago o un organizador puede ver la auditoría
+        // Solo el dueño del pago puede ver la auditoría
         if (!payment.getBuyerId().equals(requestingUserId)) {
             throw new ResponseStatusException(HttpStatus.FORBIDDEN,
                     "No tienes acceso a este pago");
+        }
         }
 
         return auditRepo.findByPaymentIdOrderByCreatedAtAsc(paymentId).stream()
