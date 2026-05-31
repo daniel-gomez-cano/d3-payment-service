@@ -6,7 +6,7 @@ POST /internal/carts/{cartId}/checkout      → marca el carrito CHECKED_OUT
 POST /internal/carts/{cartId}/paid          → marca el carrito como pagado
 POST /internal/carts/{cartId}/payment-failed → libera el carrito si el pago falla
 ```
-payment-service NO nececsita UI, la UI es de mercado pago.
+payment-service NO necesita UI, la UI es de mercado pago.
 
 - Prueba de flujo completo en sandbox. Con ambos servicios corriendo, llamas a /initiate, abres el paymentUrl en el navegador, usas las tarjetas de prueba de MercadoPago (te las dan en el panel de desarrolladores), y verificas que el webhook llega y actualiza el estado.
 
