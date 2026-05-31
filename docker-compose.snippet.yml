@@ -1,0 +1,38 @@
+  payment-service:
+    build: ./payment-service
+    container_name: payment-service
+    ports:
+      - "8084:8084"
+    environment:
+      KEYCLOAK_ISSUER_URI: http://keycloak:8080/realms/viva-eventos
+      DB_URL: jdbc:postgresql://payment-db:5432/paymentdb
+      DB_DRIVER: org.postgresql.Driver
+      DB_USER: payment_user
+      DB_PASSWORD: payment_pass
+      # Las siguientes variables DEBEN venir de un archivo .env (nunca en el compose)
+      MP_ACCESS_TOKEN: ${MP_ACCESS_TOKEN}
+      MP_SANDBOX: ${MP_SANDBOX:-true}
+      MP_WEBHOOK_SECRET: ${MP_WEBHOOK_SECRET}
+      MP_NOTIFICATION_URL: ${MP_NOTIFICATION_URL}
+      MP_BACK_URL_SUCCESS: ${MP_BACK_URL_SUCCESS:-http://localhost:3000/checkout/success}
+      MP_BACK_URL_FAILURE: ${MP_BACK_URL_FAILURE:-http://localhost:3000/checkout/failure}
+      MP_BACK_URL_PENDING: ${MP_BACK_URL_PENDING:-http://localhost:3000/checkout/pending}
+      ORDER_SERVICE_URL: http://order-service:8083
+    depends_on:
+      - payment-db
+      - keycloak
+      - order-service
+    networks:
+      - vivaeventos-net
+
+  payment-db:
+    image: postgres:16-alpine
+    container_name: payment-db
+    environment:
+      POSTGRES_DB: paymentdb
+      POSTGRES_USER: payment_user
+      POSTGRES_PASSWORD: payment_pass
+    volumes:
+      - payment-db-data:/var/lib/postgresql/data
+    networks:
+      - vivaeventos-net
