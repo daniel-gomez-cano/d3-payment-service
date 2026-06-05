@@ -1,0 +1,90 @@
+name: CI-CD payment-service
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main, develop ]
+
+permissions:
+  contents: read
+  checks: write
+  pull-requests: write
+
+env:
+  JAVA_VERSION: '21'
+  IMAGE_NAME: payment-service
+
+jobs:
+  build-and-test:
+    name: Compilar y testear
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout del codigo
+        uses: actions/checkout@v4
+
+      - name: Configurar Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ env.JAVA_VERSION }}
+          cache: maven
+
+      - name: Compilar proyecto
+        run: mvn -B -ntp clean compile
+
+      - name: Correr tests
+        run: mvn -B -ntp test
+        env:
+          MP_ACCESS_TOKEN: test-token
+          MP_WEBHOOK_SECRET: test-webhook-secret
+          ORDER_SERVICE_URL: http://localhost:8083
+          KEYCLOAK_ISSUER_URI: http://localhost:8080/realms/viva-eventos
+
+      - name: Publicar reporte de tests
+        if: always()
+        uses: dorny/test-reporter@v1
+        with:
+          name: Resultados de tests
+          path: target/surefire-reports/*.xml
+          reporter: java-junit
+
+  docker:
+    name: Publicar imagen Docker Hub
+    runs-on: ubuntu-latest
+    needs: build-and-test
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+
+    steps:
+      - name: Checkout del codigo
+        uses: actions/checkout@v4
+
+      - name: Configurar Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login a Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Generar metadatos de imagen
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ secrets.DOCKERHUB_USERNAME }}/d3-payment-service
+          tags: |
+            type=raw,value=latest
+            type=sha
+
+      - name: Build y push de imagen
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
