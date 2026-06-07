@@ -64,7 +64,8 @@ public class SecurityConfig {
             @SuppressWarnings("unchecked")
             Collection<String> roles = (Collection<String>) realmAccess.get("roles");
             return roles.stream()
-                    .map(SimpleGrantedAuthority::new)
+                    .map(role -> new SimpleGrantedAuthority(
+                            role.startsWith("ROLE_") ? role : "ROLE_" + role)) // ← fix para que Spring Security reconozca los roles correctamente
                     .collect(Collectors.toList());
         });
         return converter;
