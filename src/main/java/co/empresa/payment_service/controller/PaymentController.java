@@ -21,12 +21,12 @@ import java.util.List;
  *
  * Base path: /api/payments
  *
- * POST   /api/payments/initiate          → inicia el pago de un carrito
- * GET    /api/payments/cart/{cartId}     → consulta el pago de un carrito
- * GET    /api/payments/{paymentId}       → consulta un pago por su ID
- * GET    /api/payments/my               → historial de pagos del comprador
- * POST   /api/payments/{paymentId}/refund → reembolso (solo ORGANIZER)
- * GET    /api/payments/{paymentId}/audit → traza de auditoría
+ * POST   /api/payments/initiate            → inicia el pago de un carrito (Stripe Checkout)
+ * GET    /api/payments/cart/{cartId}       → consulta el pago asociado a un carrito
+ * GET    /api/payments/{paymentId}         → consulta un pago por su ID interno
+ * GET    /api/payments/my                 → historial de pagos del comprador autenticado
+ * POST   /api/payments/{paymentId}/refund  → reembolso (solo ORGANIZER)
+ * GET    /api/payments/{paymentId}/audit   → traza de auditoría completa
  */
 @RestController
 @RequestMapping("/api/payments")
@@ -37,7 +37,7 @@ public class PaymentController {
 
     /**
      * Inicia el proceso de pago para un carrito.
-     * Devuelve la URL de MercadoPago a la que el frontend debe redirigir al usuario.
+     * Devuelve la URL de Stripe Checkout a la que el frontend debe redirigir al usuario.
      *
      * Idempotente: si el carrito ya tiene un pago PENDING, devuelve el existente.
      */
@@ -47,14 +47,14 @@ public class PaymentController {
             @Valid @RequestBody InitiatePaymentRequest request,
             @AuthenticationPrincipal Jwt jwt) {
 
-        String buyerId   = jwt.getSubject();
-        String jwtToken  = jwt.getTokenValue();
+        String buyerId  = jwt.getSubject();
+        String jwtToken = jwt.getTokenValue();
         return paymentService.initiatePayment(request, buyerId, jwtToken);
     }
 
     /**
      * Consulta el pago asociado a un carrito.
-     * Útil para que el frontend sepa si el pago ya fue procesado.
+     * Útil para que el frontend sepa si el pago ya fue procesado al volver del success_url.
      */
     @GetMapping("/cart/{cartId}")
     public PaymentResponse getByCartId(
@@ -76,7 +76,7 @@ public class PaymentController {
     }
 
     /**
-     * Devuelve todos los pagos del comprador autenticado.
+     * Devuelve todos los pagos del comprador autenticado, ordenados por fecha descendente.
      */
     @GetMapping("/my")
     public List<PaymentResponse> getMyPayments(@AuthenticationPrincipal Jwt jwt) {
@@ -84,7 +84,7 @@ public class PaymentController {
     }
 
     /**
-     * Solicita el reembolso de un pago.
+     * Solicita el reembolso de un pago aprobado.
      * Solo accesible por usuarios con rol ORGANIZER.
      * Se usa cuando el organizador cancela un evento.
      */
