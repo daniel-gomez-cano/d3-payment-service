@@ -12,9 +12,6 @@ public interface PaymentRepository extends JpaRepository<Payment, String> {
     /** Busca por clave de idempotencia para evitar cobros duplicados. */
     Optional<Payment> findByIdempotencyKey(String idempotencyKey);
 
-    /** Busca por ID de pago de MercadoPago (llega en el webhook). */
-    Optional<Payment> findByGatewayPaymentId(String gatewayPaymentId);
-
     /** Busca por cartId para auditoría o re-consulta. */
     Optional<Payment> findByCartId(String cartId);
 
