@@ -9,23 +9,24 @@ import co.empresa.payment_service.dto.OrderCreatedEvent;
 import co.empresa.payment_service.dto.PaymentResponse;
 import co.empresa.payment_service.dto.PaymentResultEvent;
 import co.empresa.payment_service.dto.RefundRequest;
-import co.empresa.payment_service.dto.WebhookNotification;
 import co.empresa.payment_service.model.Payment;
 import co.empresa.payment_service.model.PaymentAuditLog;
 import co.empresa.payment_service.model.PaymentStatus;
 import co.empresa.payment_service.repository.PaymentAuditLogRepository;
 import co.empresa.payment_service.repository.PaymentRepository;
-import com.mercadopago.client.payment.PaymentClient;
-import com.mercadopago.client.preference.PreferenceBackUrlsRequest;
-import com.mercadopago.client.preference.PreferenceClient;
-import com.mercadopago.client.preference.PreferenceItemRequest;
-import com.mercadopago.client.preference.PreferenceRequest;
-import com.mercadopago.exceptions.MPApiException;
-import com.mercadopago.exceptions.MPException;
-import com.mercadopago.resources.preference.Preference;
+
+import com.stripe.exception.SignatureVerificationException;
+import com.stripe.exception.StripeException;
+import com.stripe.model.Event;
+import com.stripe.model.PaymentIntent;
+import com.stripe.model.Refund;
+import com.stripe.model.checkout.Session;
+import com.stripe.net.Webhook;
+import com.stripe.param.RefundCreateParams;
+import com.stripe.param.checkout.SessionCreateParams;
+
 import io.github.resilience4j.circuitbreaker.annotation.CircuitBreaker;
 import io.github.resilience4j.retry.annotation.Retry;
-import io.github.resilience4j.timelimiter.annotation.TimeLimiter;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.amqp.rabbit.core.RabbitTemplate;
@@ -39,32 +40,25 @@ import org.springframework.web.server.ResponseStatusException;
 import java.math.BigDecimal;
 import java.time.LocalDateTime;
 import java.util.List;
-import java.util.concurrent.CompletableFuture;
 
 @Service
 @RequiredArgsConstructor
 @Slf4j
 public class PaymentService {
 
-    private final PaymentRepository        paymentRepo;
+    private final PaymentRepository         paymentRepo;
     private final PaymentAuditLogRepository auditRepo;
-    private final OrderServiceClient       orderClient;
-    private final RabbitTemplate           rabbitTemplate; // inyectado con JSON converter desde RabbitMQConfig
+    private final OrderServiceClient        orderClient;
+    private final RabbitTemplate            rabbitTemplate; // inyectado con JSON converter desde RabbitMQConfig
 
-    @Value("${mercadopago.sandbox:true}")
-    private boolean sandbox;
+    @Value("${stripe.webhook-secret}")
+    private String webhookSecret;
 
-    @Value("${mercadopago.notification-url}")
-    private String notificationUrl;
+    @Value("${stripe.success-url}")
+    private String successUrl;
 
-    @Value("${mercadopago.back-url.success}")
-    private String backUrlSuccess;
-
-    @Value("${mercadopago.back-url.failure}")
-    private String backUrlFailure;
-
-    @Value("${mercadopago.back-url.pending}")
-    private String backUrlPending;
+    @Value("${stripe.cancel-url}")
+    private String cancelUrl;
 
     // ================================================================
     //  INICIAR PAGO — flujo HTTP (desde PaymentController)
@@ -76,7 +70,7 @@ public class PaymentService {
      * Flujo:
      *  1. Verificar idempotencia — si ya existe un Payment para este cartId, devolver el existente.
      *  2. Obtener resumen del carrito desde el order-service (con JWT).
-     *  3. Crear preferencia en MercadoPago (con Circuit Breaker + Retry).
+     *  3. Crear sesión de Stripe Checkout (con Circuit Breaker + Retry).
      *  4. Persistir el Payment en estado PENDING.
      *  5. Notificar al order-service que el carrito entró en CHECKED_OUT.
      *  6. Devolver la URL de pago al frontend.
@@ -110,20 +104,17 @@ public class PaymentService {
                     "El total del carrito debe ser mayor a cero");
         }
 
-        // 3. CREAR PREFERENCIA EN MERCADOPAGO
-        Preference preference = createMercadoPagoPreference(cart, idempotencyKey);
+        // 3. CREAR SESIÓN DE STRIPE CHECKOUT
+        Session session   = createStripeCheckoutSession(cart, idempotencyKey);
+        String paymentUrl = session.getUrl();
 
         // 4. PERSISTIR PAYMENT
-        String paymentUrl = sandbox
-                ? preference.getSandboxInitPoint()
-                : preference.getInitPoint();
-
         Payment payment;
         try {
             payment = paymentRepo.save(Payment.builder()
                     .cartId(cartId)
                     .buyerId(buyerId)
-                    .gatewayPreferenceId(preference.getId())
+                    .stripeSessionId(session.getId())   // cs_test_... / cs_live_...
                     .idempotencyKey(idempotencyKey)
                     .amount(cart.total())
                     .currency(cart.currency() != null ? cart.currency() : "COP")
@@ -140,7 +131,7 @@ public class PaymentService {
 
         saveAuditLog(payment.getId(), null, PaymentStatus.PENDING,
                 "BUYER:" + buyerId,
-                "Preferencia creada en MercadoPago — ID: " + preference.getId());
+                "Sesión Stripe creada — sessionId: " + session.getId());
 
         // 5. NOTIFICAR CHECKOUT al order-service (vía HTTP, el JWT sigue siendo válido)
         orderClient.notifyCheckout(cartId, jwtToken);
@@ -170,19 +161,16 @@ public class PaymentService {
             return;
         }
 
-        // CREAR PREFERENCIA EN MERCADOPAGO con los datos del evento
-        Preference preference = createPreferenceFromEvent(event);
-
-        String paymentUrl = sandbox
-                ? preference.getSandboxInitPoint()
-                : preference.getInitPoint();
+        // CREAR SESIÓN STRIPE con los datos del evento
+        Session session   = createStripeSessionFromEvent(event);
+        String paymentUrl = session.getUrl();
 
         Payment payment;
         try {
             payment = paymentRepo.save(Payment.builder()
                     .cartId(cartId)
                     .buyerId(event.getBuyerId())
-                    .gatewayPreferenceId(preference.getId())
+                    .stripeSessionId(session.getId())   // cs_test_... / cs_live_...
                     .idempotencyKey(cartId)
                     .amount(event.getTotal())
                     .currency("COP")
@@ -196,7 +184,7 @@ public class PaymentService {
 
         saveAuditLog(payment.getId(), null, PaymentStatus.PENDING,
                 "RABBITMQ:order-service",
-                "Preferencia MP creada desde evento — ID: " + preference.getId());
+                "Sesión Stripe creada desde evento — sessionId: " + session.getId());
 
         // Notificar a order-service que el pago está PENDING (incluye paymentUrl)
         publishPaymentResult(payment, null);
@@ -204,240 +192,231 @@ public class PaymentService {
         log.info("[RabbitMQ] Pago PENDING creado id={} para cartId={}", payment.getId(), cartId);
     }
 
+    // ================================================================
+    //  STRIPE — creación de sesiones de Checkout
+    // ================================================================
+
     /**
-     * Crea la preferencia de MercadoPago desde los datos del OrderCreatedEvent.
-     * No llama a orderClient — usa directamente los datos del mensaje.
+     * Crea la sesión de Stripe Checkout para el flujo HTTP (CartSummaryInternal).
+     * Protegido con Circuit Breaker + Retry apuntando a la instancia "stripe".
      */
-    @CircuitBreaker(name = "mercadopago", fallbackMethod = "mercadoPagoEventFallback")
-    @Retry(name = "mercadopago")
-    private Preference createPreferenceFromEvent(OrderCreatedEvent event) {
+    @CircuitBreaker(name = "stripe", fallbackMethod = "stripeCheckoutFallback")
+    @Retry(name = "stripe")
+    private Session createStripeCheckoutSession(CartSummaryInternal cart, String idempotencyKey) {
         try {
-            String description = event.getItems() != null && !event.getItems().isEmpty()
-                    ? event.getItems().get(0).getTicketTypeName()
-                    + (event.getItems().size() > 1
-                    ? " y " + (event.getItems().size() - 1) + " más" : "")
-                    : "Boletas VivaEventos";
-
-            PreferenceItemRequest item = PreferenceItemRequest.builder()
-                    .title(description)
-                    .quantity(1)
-                    .unitPrice(event.getTotal())
-                    .currencyId("COP")
-                    .build();
-
-            PreferenceBackUrlsRequest backUrls = PreferenceBackUrlsRequest.builder()
-                    .success(backUrlSuccess)
-                    .failure(backUrlFailure)
-                    .pending(backUrlPending)
-                    .build();
-
-            PreferenceRequest preferenceReq = PreferenceRequest.builder()
-                    .items(List.of(item))
-                    .backUrls(backUrls)
-                    .autoReturn("approved")
-                    .notificationUrl(notificationUrl)
-                    .externalReference(event.getCartId()) // correlaciona el webhook con el carrito
-                    .build();
-
-            return new PreferenceClient().create(preferenceReq);
-
-        } catch (MPApiException e) {
-            log.error("[RabbitMQ][MP] API error {}: {}", e.getStatusCode(), e.getApiResponse().getContent());
+            return buildStripeSession(
+                    cart.cartId(),
+                    cart.total(),
+                    buildDescription(cart.items() != null
+                            ? cart.items().stream().map(i -> i.ticketTypeName()).toList()
+                            : List.of())
+            );
+        } catch (StripeException e) {
+            log.error("[HTTP][Stripe] Error al crear sesión: {}", e.getMessage());
             throw new ResponseStatusException(HttpStatus.BAD_GATEWAY,
-                    "Error MP API: " + e.getMessage());
-        } catch (MPException e) {
-            log.error("[RabbitMQ][MP] SDK error: {}", e.getMessage());
-            throw new ResponseStatusException(HttpStatus.SERVICE_UNAVAILABLE,
-                    "MP no disponible: " + e.getMessage());
+                    "Error al crear la sesión de pago: " + e.getMessage());
         }
     }
 
+    /**
+     * Crea la sesión de Stripe Checkout para el flujo RabbitMQ (OrderCreatedEvent).
+     * No llama a orderClient — usa directamente los datos del mensaje.
+     */
+    @CircuitBreaker(name = "stripe", fallbackMethod = "stripeEventFallback")
+    @Retry(name = "stripe")
+    private Session createStripeSessionFromEvent(OrderCreatedEvent event) {
+        try {
+            List<String> itemNames = event.getItems() != null
+                    ? event.getItems().stream().map(i -> i.getTicketTypeName()).toList()
+                    : List.of();
+            return buildStripeSession(event.getCartId(), event.getTotal(),
+                    buildDescription(itemNames));
+        } catch (StripeException e) {
+            log.error("[RabbitMQ][Stripe] Error al crear sesión: {}", e.getMessage());
+            throw new ResponseStatusException(HttpStatus.BAD_GATEWAY,
+                    "Error al crear la sesión de Stripe: " + e.getMessage());
+        }
+    }
+
+    /**
+     * Construye y envía el SessionCreateParams a la API de Stripe.
+     * La correlación con el webhook se hace mediante metadata.cartId.
+     */
+    private Session buildStripeSession(String cartId, BigDecimal total,
+                                       String description) throws StripeException {
+
+        // Stripe recibe el monto en la unidad mínima de la moneda.
+        // COP usa centavos (×100), igual que USD o EUR.
+        long unitAmountCentavos = total.multiply(BigDecimal.valueOf(100)).longValue();
+
+        SessionCreateParams params = SessionCreateParams.builder()
+                .setMode(SessionCreateParams.Mode.PAYMENT)
+                .addLineItem(
+                        SessionCreateParams.LineItem.builder()
+                                .setQuantity(1L)
+                                .setPriceData(
+                                        SessionCreateParams.LineItem.PriceData.builder()
+                                                .setCurrency("cop")
+                                                .setUnitAmount(unitAmountCentavos)
+                                                .setProductData(
+                                                        SessionCreateParams.LineItem.PriceData
+                                                                .ProductData.builder()
+                                                                .setName(description)
+                                                                .build())
+                                                .build())
+                                .build())
+                .setSuccessUrl(successUrl)   // incluye {CHECKOUT_SESSION_ID} si se necesita en el frontend
+                .setCancelUrl(cancelUrl)
+                .putMetadata("cartId", cartId) // clave de correlación para el webhook
+                .build();
+
+        return Session.create(params);
+    }
+
+    private String buildDescription(List<String> ticketTypeNames) {
+        if (ticketTypeNames == null || ticketTypeNames.isEmpty()) {
+            return "Boletas VivaEventos";
+        }
+        return ticketTypeNames.get(0)
+                + (ticketTypeNames.size() > 1
+                ? " y " + (ticketTypeNames.size() - 1) + " más"
+                : "");
+    }
+
+    // Fallbacks del Circuit Breaker
+
     @SuppressWarnings("unused")
-    private Preference mercadoPagoEventFallback(OrderCreatedEvent event, Throwable t) {
-        log.error("[CircuitBreaker] MP no disponible para cartId={}: {}",
+    private Session stripeCheckoutFallback(CartSummaryInternal cart,
+                                           String idempotencyKey, Throwable t) {
+        log.error("[CircuitBreaker] Stripe no disponible — {}", t.getMessage());
+        throw new ResponseStatusException(HttpStatus.SERVICE_UNAVAILABLE,
+                "La pasarela de pagos no está disponible. Por favor intenta en unos minutos.");
+    }
+
+    @SuppressWarnings("unused")
+    private Session stripeEventFallback(OrderCreatedEvent event, Throwable t) {
+        log.error("[CircuitBreaker] Stripe no disponible para cartId={}: {}",
                 event.getCartId(), t.getMessage());
         throw new ResponseStatusException(HttpStatus.SERVICE_UNAVAILABLE,
                 "La pasarela de pagos no está disponible. Por favor intenta en unos minutos.");
     }
 
     // ================================================================
-    //  PREFERENCIA MERCADOPAGO — flujo HTTP (CartSummaryInternal)
-    // ================================================================
-
-    @CircuitBreaker(name = "mercadopago", fallbackMethod = "mercadoPagoFallback")
-    @Retry(name = "mercadopago")
-    @TimeLimiter(name = "mercadopago")
-    public CompletableFuture<Preference> createMercadoPagoPreferenceAsync(
-            CartSummaryInternal cart, String idempotencyKey) {
-        return CompletableFuture.supplyAsync(() -> {
-            try {
-                return buildAndSendPreference(cart, idempotencyKey);
-            } catch (MPException | MPApiException e) {
-                throw new RuntimeException(e);
-            }
-        });
-    }
-
-    @CircuitBreaker(name = "mercadopago", fallbackMethod = "mercadoPagoPreferenceFallback")
-    @Retry(name = "mercadopago")
-    private Preference createMercadoPagoPreference(CartSummaryInternal cart, String idempotencyKey) {
-        try {
-            return buildAndSendPreference(cart, idempotencyKey);
-        } catch (MPApiException e) {
-            log.error("[HTTP][MP] API error {}: {}", e.getStatusCode(), e.getApiResponse().getContent());
-            throw new ResponseStatusException(HttpStatus.BAD_GATEWAY,
-                    "Error al crear la preferencia de pago: " + e.getMessage());
-        } catch (MPException e) {
-            log.error("[HTTP][MP] SDK error: {}", e.getMessage());
-            throw new ResponseStatusException(HttpStatus.SERVICE_UNAVAILABLE,
-                    "No se pudo conectar con la pasarela de pagos. Intenta de nuevo.");
-        }
-    }
-
-    private Preference buildAndSendPreference(CartSummaryInternal cart, String idempotencyKey)
-            throws MPException, MPApiException {
-
-        String description = cart.items() != null && !cart.items().isEmpty()
-                ? cart.items().get(0).ticketTypeName()
-                + (cart.items().size() > 1 ? " y " + (cart.items().size() - 1) + " más" : "")
-                : "Boletas VivaEventos";
-
-        PreferenceItemRequest item = PreferenceItemRequest.builder()
-                .title(description)
-                .quantity(1)
-                .unitPrice(cart.total())
-                .currencyId("COP")
-                .build();
-
-        PreferenceBackUrlsRequest backUrls = PreferenceBackUrlsRequest.builder()
-                .success(backUrlSuccess)
-                .failure(backUrlFailure)
-                .pending(backUrlPending)
-                .build();
-
-        PreferenceRequest preferenceReq = PreferenceRequest.builder()
-                .items(List.of(item))
-                .backUrls(backUrls)
-                .autoReturn("approved")
-                .notificationUrl(notificationUrl)
-                .externalReference(cart.cartId())
-                .build();
-
-        return new PreferenceClient().create(preferenceReq);
-    }
-
-    @SuppressWarnings("unused")
-    private Preference mercadoPagoPreferenceFallback(CartSummaryInternal cart,
-                                                     String idempotencyKey, Throwable t) {
-        log.error("[CircuitBreaker] MercadoPago no disponible — {}", t.getMessage());
-        throw new ResponseStatusException(HttpStatus.SERVICE_UNAVAILABLE,
-                "La pasarela de pagos no está disponible. Por favor intenta en unos minutos.");
-    }
-
-    @SuppressWarnings("unused")
-    private CompletableFuture<Preference> mercadoPagoFallback(CartSummaryInternal cart,
-                                                              String idempotencyKey, Throwable t) {
-        log.error("[CircuitBreaker][Async] MercadoPago no disponible — {}", t.getMessage());
-        return CompletableFuture.failedFuture(
-                new ResponseStatusException(HttpStatus.SERVICE_UNAVAILABLE,
-                        "La pasarela de pagos no está disponible."));
-    }
-
-    // ================================================================
-    //  PROCESAR WEBHOOK DE MERCADOPAGO
+    //  PROCESAR WEBHOOK DE STRIPE
     // ================================================================
 
     /**
-     * Procesa la notificación asíncrona de MercadoPago.
+     * Procesa la notificación asíncrona de Stripe.
      *
      * Flujo:
-     *  1. Consulta el pago real a la API de MP usando el gatewayPaymentId.
-     *  2. Busca el Payment local usando la referencia externa (cartId).
-     *  3. Actualiza el estado y registra en auditoría.
-     *  4. Publica PaymentResultEvent → payment.exchange (order-service lo consume).
+     *  1. Verificar la firma HMAC-SHA256 del payload con Webhook.constructEvent().
+     *  2. Dispatch al handler según el tipo de evento.
+     *  3. Cada handler actualiza el Payment, registra auditoría y publica a RabbitMQ.
+     *
+     * Eventos manejados:
+     *  · checkout.session.completed    → APPROVED  (pago exitoso)
+     *  · checkout.session.expired      → FAILED    (sesión venció sin pago)
+     *  · payment_intent.payment_failed → REJECTED  (el intento de cobro fue rechazado)
      */
     @Transactional
-    public void processWebhook(WebhookNotification notification) {
-        if (!"payment".equals(notification.getType())) {
-            log.debug("[Webhook] Tipo ignorado: {}", notification.getType());
-            return;
+    public void processWebhook(String payload, String sigHeader) {
+        Event event;
+        try {
+            event = Webhook.constructEvent(payload, sigHeader, webhookSecret);
+        } catch (SignatureVerificationException e) {
+            log.warn("[Webhook] Firma inválida: {}", e.getMessage());
+            throw new ResponseStatusException(HttpStatus.BAD_REQUEST,
+                    "Firma de webhook inválida");
         }
 
-        String gatewayPaymentId = notification.getData().getId();
-        log.info("[Webhook] Procesando notificación — gatewayPaymentId={}", gatewayPaymentId);
+        log.info("[Webhook] Evento recibido: {}", event.getType());
 
-        com.mercadopago.resources.payment.Payment mpPayment = fetchPaymentFromGateway(gatewayPaymentId);
-        if (mpPayment == null) {
-            log.warn("[Webhook] No se pudo obtener el pago {} de MercadoPago", gatewayPaymentId);
-            return;
+        switch (event.getType()) {
+            case "checkout.session.completed"    -> handleSessionCompleted(event);
+            case "checkout.session.expired"      -> handleSessionExpired(event);
+            case "payment_intent.payment_failed" -> handlePaymentFailed(event);
+            default -> log.debug("[Webhook] Evento ignorado: {}", event.getType());
         }
+    }
 
-        String cartId         = mpPayment.getExternalReference();
-        String mpStatus       = mpPayment.getStatus();
-        String mpStatusDetail = mpPayment.getStatusDetail();
+    private void handleSessionCompleted(Event event) {
+        Session session = (Session) event.getDataObjectDeserializer()
+                .getObject()
+                .orElseThrow(() -> new ResponseStatusException(HttpStatus.BAD_REQUEST,
+                        "No se pudo deserializar el evento checkout.session.completed"));
 
-        log.info("[Webhook] gatewayPaymentId={} cartId={} status={} detail={}",
-                gatewayPaymentId, cartId, mpStatus, mpStatusDetail);
+        String cartId          = session.getMetadata().get("cartId");
+        String paymentIntentId = session.getPaymentIntent(); // pi_... necesario para reembolsos
 
-        Payment payment = paymentRepo.findByCartId(cartId)
-                .orElseGet(() -> paymentRepo.findByGatewayPaymentId(gatewayPaymentId).orElse(null));
-
+        Payment payment = paymentRepo.findByCartId(cartId).orElse(null);
         if (payment == null) {
-            log.warn("[Webhook] No se encontró Payment para cartId={} — ignorando", cartId);
+            log.warn("[Webhook] No se encontró Payment para cartId={}", cartId);
             return;
         }
-
-        // IDEMPOTENCIA: evitar procesar el mismo estado dos veces
-        PaymentStatus newStatus = mapMercadoPagoStatus(mpStatus);
-        if (payment.getStatus() == newStatus) {
-            log.info("[Webhook] Estado ya actualizado a {} para payment={} — ignorando duplicado",
-                    newStatus, payment.getId());
+        if (payment.getStatus() == PaymentStatus.APPROVED) {
+            log.info("[Webhook] Pago ya APPROVED para cartId={} — ignorando duplicado", cartId);
             return;
         }
 
         PaymentStatus previousStatus = payment.getStatus();
-
-        payment.setGatewayPaymentId(gatewayPaymentId);
-        payment.setStatus(newStatus);
-
-        if (newStatus == PaymentStatus.APPROVED) {
-            payment.setPaidAt(LocalDateTime.now());
-        }
-        if (newStatus == PaymentStatus.REJECTED || newStatus == PaymentStatus.FAILED) {
-            payment.setFailureReason(mpStatusDetail);
-        }
-
+        payment.setStripeSessionId(session.getId());      // actualiza por si acaso (idempotente)
+        payment.setPaymentIntentId(paymentIntentId);      // pi_... guardado para reembolsos futuros
+        payment.setStatus(PaymentStatus.APPROVED);
+        payment.setPaidAt(LocalDateTime.now());
         paymentRepo.save(payment);
 
-        saveAuditLog(payment.getId(), previousStatus, newStatus,
-                "WEBHOOK:mercadopago",
-                "MP status=" + mpStatus + " detail=" + mpStatusDetail + " mpId=" + gatewayPaymentId);
+        saveAuditLog(payment.getId(), previousStatus, PaymentStatus.APPROVED,
+                "WEBHOOK:stripe",
+                "checkout.session.completed — sessionId=" + session.getId()
+                        + " paymentIntentId=" + paymentIntentId);
 
-        // Notificar a order-service vía RabbitMQ (reemplaza las llamadas HTTP anteriores)
-        publishPaymentResult(payment, mpStatusDetail);
-
-        log.info("[Webhook] Payment id={} actualizado: {} → {}", payment.getId(), previousStatus, newStatus);
+        publishPaymentResult(payment, null);
+        log.info("[Webhook] Payment id={} → APPROVED", payment.getId());
     }
 
-    @CircuitBreaker(name = "mercadopago")
-    @Retry(name = "mercadopago")
-    private com.mercadopago.resources.payment.Payment fetchPaymentFromGateway(String gatewayPaymentId) {
-        try {
-            return new PaymentClient().get(Long.parseLong(gatewayPaymentId));
-        } catch (MPApiException | MPException e) {
-            log.error("[Webhook] Error al consultar pago {} en MP: {}", gatewayPaymentId, e.getMessage());
-            return null;
+    private void handleSessionExpired(Event event) {
+        Session session = (Session) event.getDataObjectDeserializer()
+                .getObject().orElse(null);
+        if (session == null) return;
+
+        String cartId = session.getMetadata().get("cartId");
+        updateToFailedStatus(cartId, "La sesión de pago expiró sin completarse");
+    }
+
+    private void handlePaymentFailed(Event event) {
+        PaymentIntent pi = (PaymentIntent) event.getDataObjectDeserializer()
+                .getObject().orElse(null);
+        if (pi == null) return;
+
+        // Buscamos por paymentIntentId (guardado en handleSessionCompleted si el intento
+        // existía antes de fallar) o ignoramos si aún no tenemos registro.
+        paymentRepo.findByPaymentIntentId(pi.getId()).ifPresent(payment ->
+                updatePaymentStatus(payment, PaymentStatus.REJECTED,
+                        pi.getLastPaymentError() != null
+                                ? pi.getLastPaymentError().getMessage()
+                                : "payment_intent.payment_failed")
+        );
+    }
+
+    private void updateToFailedStatus(String cartId, String detail) {
+        paymentRepo.findByCartId(cartId).ifPresent(payment -> {
+            if (payment.getStatus() == PaymentStatus.PENDING) {
+                updatePaymentStatus(payment, PaymentStatus.FAILED, detail);
+            }
+        });
+    }
+
+    private void updatePaymentStatus(Payment payment, PaymentStatus newStatus, String detail) {
+        PaymentStatus previousStatus = payment.getStatus();
+        payment.setStatus(newStatus);
+        if (newStatus == PaymentStatus.REJECTED || newStatus == PaymentStatus.FAILED) {
+            payment.setFailureReason(detail);
         }
-    }
+        paymentRepo.save(payment);
 
-    private PaymentStatus mapMercadoPagoStatus(String mpStatus) {
-        return switch (mpStatus) {
-            case "approved"               -> PaymentStatus.APPROVED;
-            case "rejected"               -> PaymentStatus.REJECTED;
-            case "cancelled"              -> PaymentStatus.FAILED;
-            case "refunded", "charged_back" -> PaymentStatus.REFUNDED;
-            default                       -> PaymentStatus.PENDING;
-        };
+        saveAuditLog(payment.getId(), previousStatus, newStatus, "WEBHOOK:stripe", detail);
+        publishPaymentResult(payment, detail);
+        log.info("[Webhook] Payment id={} → {}", payment.getId(), newStatus);
     }
 
     // ================================================================
@@ -447,6 +426,10 @@ public class PaymentService {
     /**
      * Procesa un reembolso de un pago aprobado.
      * Solo puede ejecutarlo un ORGANIZER (validado por @PreAuthorize en el controller).
+     *
+     * Stripe requiere el PaymentIntent ID (pi_...) para emitir el reembolso.
+     * Este ID se persiste en Payment.paymentIntentId cuando llega el webhook
+     * checkout.session.completed.
      */
     @Transactional
     public PaymentResponse refundPayment(String paymentId, RefundRequest req, String actorId) {
@@ -458,12 +441,12 @@ public class PaymentService {
             throw new ResponseStatusException(HttpStatus.CONFLICT,
                     "Solo se pueden reembolsar pagos APPROVED. Estado actual: " + payment.getStatus());
         }
-        if (payment.getGatewayPaymentId() == null) {
+        if (payment.getPaymentIntentId() == null) {
             throw new ResponseStatusException(HttpStatus.CONFLICT,
-                    "Este pago no tiene ID de pasarela registrado; no se puede reembolsar automáticamente.");
+                    "Este pago no tiene PaymentIntent registrado; no se puede reembolsar automáticamente.");
         }
 
-        processRefundInGateway(Long.parseLong(payment.getGatewayPaymentId()));
+        processRefundInGateway(payment.getPaymentIntentId());
 
         PaymentStatus previousStatus = payment.getStatus();
         payment.setStatus(PaymentStatus.REFUNDED);
@@ -474,26 +457,23 @@ public class PaymentService {
                 "SYSTEM:refund:organizer=" + actorId,
                 "Razón: " + req.getReason());
 
-        // Notificar a order-service del reembolso vía RabbitMQ
         publishPaymentResult(payment, req.getReason());
 
         log.info("[Refund] Reembolso procesado — paymentId={} cartId={}", paymentId, payment.getCartId());
         return toResponse(payment);
     }
 
-    @CircuitBreaker(name = "mercadopago")
-    @Retry(name = "mercadopago")
-    private void processRefundInGateway(Long gatewayPaymentId) {
+    @CircuitBreaker(name = "stripe")
+    @Retry(name = "stripe")
+    private void processRefundInGateway(String paymentIntentId) {
         try {
-            new PaymentClient().refund(gatewayPaymentId);
-        } catch (MPApiException e) {
-            log.error("[Refund] API MP error {}: {}", e.getStatusCode(), e.getApiResponse().getContent());
+            Refund.create(RefundCreateParams.builder()
+                    .setPaymentIntent(paymentIntentId)
+                    .build());
+        } catch (StripeException e) {
+            log.error("[Refund] Stripe error: {}", e.getMessage());
             throw new ResponseStatusException(HttpStatus.BAD_GATEWAY,
                     "Error al procesar el reembolso en la pasarela: " + e.getMessage());
-        } catch (MPException e) {
-            log.error("[Refund] SDK MP error: {}", e.getMessage());
-            throw new ResponseStatusException(HttpStatus.SERVICE_UNAVAILABLE,
-                    "No se pudo conectar con la pasarela para el reembolso. Intenta de nuevo.");
         }
     }
 
@@ -503,7 +483,8 @@ public class PaymentService {
 
     /**
      * Publica el resultado del pago hacia order-service.
-     * Usado por: processWebhook, initiatePaymentFromEvent (PENDING), refundPayment.
+     * Usado por: processWebhook (todos los estados), initiatePaymentFromEvent (PENDING),
+     * refundPayment.
      */
     private void publishPaymentResult(Payment payment, String statusDetail) {
         PaymentResultEvent event = PaymentResultEvent.builder()
@@ -517,17 +498,17 @@ public class PaymentService {
                 .build();
 
         rabbitTemplate.convertAndSend(
-                RabbitMQConfig.PAYMENT_EXCHANGE,   // "payment.exchange"
-                RabbitMQConfig.PAYMENT_RESULT_KEY, // "payment.result"
-                event
-        );
+                RabbitMQConfig.PAYMENT_EXCHANGE,    // "payment.exchange"
+                RabbitMQConfig.PAYMENT_RESULT_KEY,  // "payment.result"
+                event);
+
         log.info("[RabbitMQ] → PaymentResultEvent publicado — cartId={} status={}",
                 payment.getCartId(), payment.getStatus());
     }
 
     /**
      * Publica un FAILED cuando el listener falla antes de crear el Payment en BD.
-     * (MercadoPago rechazó, circuit breaker abierto, etc.)
+     * (Stripe rechazó, circuit breaker abierto, etc.)
      * Llamado desde PaymentEventListener en el bloque catch.
      */
     public void publishFailedResult(OrderCreatedEvent event, String errorMsg) {
@@ -542,8 +523,8 @@ public class PaymentService {
         rabbitTemplate.convertAndSend(
                 RabbitMQConfig.PAYMENT_EXCHANGE,
                 RabbitMQConfig.PAYMENT_RESULT_KEY,
-                result
-        );
+                result);
+
         log.warn("[RabbitMQ] → PaymentResultEvent FAILED publicado — cartId={}", event.getCartId());
     }
 

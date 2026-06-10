@@ -9,19 +9,22 @@ import java.time.LocalDateTime;
 /**
  * Entidad principal que representa un intento/transacción de pago.
  *
- * Cada vez que un comprador inicia el pago de un carrito se crea UN registro aquí.
- * El campo idempotencyKey (= cartId) garantiza que nunca se cobre dos veces
- * el mismo carrito: si llega una segunda solicitud con el mismo cartId,
- * se devuelve el Payment existente en lugar de crear uno nuevo.
+ * Cada vez que un comprador inicia el pago de un carrito se crea UN registro.
+ * El campo idempotencyKey (= cartId) evita cobros duplicados.
  */
 @Entity
 @Table(name = "payments", indexes = {
-        @Index(name = "idx_payments_cart_id",       columnList = "cart_id"),
-        @Index(name = "idx_payments_buyer_id",      columnList = "buyer_id"),
-        @Index(name = "idx_payments_idempotency",   columnList = "idempotency_key", unique = true),
-        @Index(name = "idx_payments_gateway_id",    columnList = "gateway_payment_id")
+        @Index(name = "idx_payments_cart_id", columnList = "cart_id"),
+        @Index(name = "idx_payments_buyer_id", columnList = "buyer_id"),
+        @Index(name = "idx_payments_idempotency", columnList = "idempotency_key", unique = true),
+        @Index(name = "idx_payments_payment_intent", columnList = "payment_intent_id"),
+        @Index(name = "idx_payments_session", columnList = "stripe_session_id")
 })
-@Getter @Setter @NoArgsConstructor @AllArgsConstructor @Builder
+@Getter
+@Setter
+@NoArgsConstructor
+@AllArgsConstructor
+@Builder
 public class Payment {
 
     @Id
@@ -30,7 +33,7 @@ public class Payment {
 
     // -------- Referencias externas --------
 
-    /** ID del carrito en el order-service que originó este pago. */
+    /** ID del carrito en order-service. */
     @Column(name = "cart_id", nullable = false)
     private String cartId;
 
@@ -38,30 +41,37 @@ public class Payment {
     @Column(name = "buyer_id", nullable = false)
     private String buyerId;
 
-    // -------- Pasarela (MercadoPago) --------
+    // -------- Stripe --------
 
     /**
-     * ID de preferencia de MercadoPago (se genera al llamar a la API).
-     * Permite redirigir al usuario al checkout de MP.
+     * ID de la Checkout Session creada en Stripe.
+     * Ejemplo: cs_test_xxxxxxxxx
      */
-    @Column(name = "gateway_preference_id")
-    private String gatewayPreferenceId;
+    @Column(name = "stripe_session_id")
+    private String stripeSessionId;
 
     /**
-     * ID numérico del pago en MercadoPago (llega por webhook una vez pagado).
-     * Es el que se usa para consultar el estado real y hacer reembolsos.
+     * ID del PaymentIntent generado por Stripe.
+     * Ejemplo: pi_xxxxxxxxx
      */
-    @Column(name = "gateway_payment_id")
-    private String gatewayPaymentId;
+    @Column(name = "payment_intent_id")
+    private String PaymentIntentId;
+
+    /**
+     * ID del Charge asociado al pago.
+     * Ejemplo: ch_xxxxxxxxx
+     */
+    @Column(name = "stripe_charge_id")
+    private String stripeChargeId;
 
     // -------- Idempotencia --------
 
-    /**
-     * Clave única que evita cobros duplicados.
-     * Se construye como el cartId; si dos hilos concurrentes llegan con el
-     * mismo cartId, la restricción UNIQUE de la BD garantiza que solo uno triunfa.
-     */
-    @Column(name = "idempotency_key", nullable = false, unique = true, length = 255)
+    @Column(
+            name = "idempotency_key",
+            nullable = false,
+            unique = true,
+            length = 255
+    )
     private String idempotencyKey;
 
     // -------- Financiero --------
@@ -69,7 +79,10 @@ public class Payment {
     @Column(nullable = false, precision = 14, scale = 2)
     private BigDecimal amount;
 
-    /** Código ISO 4217. Para Colombia: "COP". */
+    /**
+     * Código ISO 4217.
+     * Stripe espera minúsculas (cop, usd, eur...)
+     */
     @Column(nullable = false, length = 3)
     private String currency;
 
@@ -80,22 +93,25 @@ public class Payment {
     private PaymentStatus status;
 
     /**
-     * URL de pago generada por MercadoPago.
-     * En sandbox: getSandboxInitPoint(); en producción: getInitPoint().
+     * URL del Checkout de Stripe.
      */
     @Column(name = "payment_url", length = 2048)
     private String paymentUrl;
 
-    /** Razón del rechazo/fallo (del webhook de MP o de la excepción capturada). */
+    /**
+     * Mensaje de error devuelto por Stripe.
+     */
     @Column(name = "failure_reason", length = 500)
     private String failureReason;
 
-    /** Veces que se reintentó la llamada a la pasarela antes de crear/actualizar. */
+    /**
+     * Número de reintentos realizados.
+     */
     @Column(name = "retry_count", nullable = false)
     @Builder.Default
     private int retryCount = 0;
 
-    // -------- Auditoría de fechas --------
+    // -------- Auditoría --------
 
     @Column(name = "created_at", nullable = false, updatable = false)
     private LocalDateTime createdAt;
@@ -103,19 +119,26 @@ public class Payment {
     @Column(name = "updated_at")
     private LocalDateTime updatedAt;
 
-    /** Fecha exacta en que MercadoPago confirmó el pago. */
+    /**
+     * Fecha confirmada por Stripe mediante webhook.
+     */
     @Column(name = "paid_at")
     private LocalDateTime paidAt;
 
-    /** Fecha en que se procesó el reembolso. */
+    /**
+     * Fecha de reembolso.
+     */
     @Column(name = "refunded_at")
     private LocalDateTime refundedAt;
 
     @PrePersist
     void prePersist() {
         createdAt = LocalDateTime.now();
-        updatedAt  = LocalDateTime.now();
-        if (status == null) status = PaymentStatus.PENDING;
+        updatedAt = LocalDateTime.now();
+
+        if (status == null) {
+            status = PaymentStatus.PENDING;
+        }
     }
 
     @PreUpdate
