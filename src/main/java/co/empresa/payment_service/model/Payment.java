@@ -55,7 +55,7 @@ public class Payment {
      * Ejemplo: pi_xxxxxxxxx
      */
     @Column(name = "payment_intent_id")
-    private String PaymentIntentId;
+    private String paymentIntentId;
 
     /**
      * ID del Charge asociado al pago.
