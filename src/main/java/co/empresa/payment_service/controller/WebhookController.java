@@ -1,33 +1,48 @@
 package co.empresa.payment_service.controller;
 
-import co.empresa.payment_service.dto.WebhookNotification;
 import co.empresa.payment_service.service.PaymentService;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
-import org.springframework.beans.factory.annotation.Value;
-import org.springframework.http.HttpStatus;
+import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
-
-import javax.crypto.Mac;
-import javax.crypto.spec.SecretKeySpec;
-import java.nio.charset.StandardCharsets;
-import java.util.HexFormat;
+import org.springframework.web.server.ResponseStatusException;
 
 /**
- * Recibe las notificaciones asíncronas (webhooks) de MercadoPago.
+ * Recibe las notificaciones asíncronas (webhooks) de Stripe.
  *
- * Este endpoint NO requiere JWT de Keycloak porque MercadoPago no envía tokens JWT.
- * En cambio, validamos la autenticidad de la petición con la firma HMAC que MP incluye
- * en la cabecera "x-signature".
+ * ──────────────────────────────────────────────────────────────────────────
+ *  SEGURIDAD
+ * ──────────────────────────────────────────────────────────────────────────
+ * Este endpoint NO requiere JWT de Keycloak — Stripe no envía tokens.
+ * La autenticidad se garantiza mediante la firma HMAC-SHA256 que Stripe
+ * incluye en el header "Stripe-Signature". La verificación se realiza en
+ * PaymentService.processWebhook() mediante Webhook.constructEvent(), que
+ * lanza SignatureVerificationException si la firma no coincide.
  *
- * Referencia: https://www.mercadopago.com.co/developers/es/docs/your-integrations/notifications/webhooks
+ * Asegúrate de excluir este path en tu SecurityFilterChain:
+ *   .requestMatchers("/api/payments/webhook/**").permitAll()
  *
- * ¿Cómo funciona la firma HMAC de MercadoPago?
- *   1. MP envía las cabeceras: x-request-id, x-signature
- *   2. x-signature tiene formato: "ts=TIMESTAMP,v1=HMAC_HEX"
- *   3. El mensaje a verificar es: "id:{dataId};request-id:{requestId};ts:{timestamp};"
- *   4. Se calcula HMAC-SHA256 con la clave MP_WEBHOOK_SECRET y se compara con v1.
+ * ──────────────────────────────────────────────────────────────────────────
+ *  BODY RAW — MUY IMPORTANTE
+ * ──────────────────────────────────────────────────────────────────────────
+ * El cuerpo de la petición debe llegar a Stripe.Webhook.constructEvent()
+ * exactamente como Stripe lo envió (bytes sin modificar).
+ * Por eso el parámetro es @RequestBody String payload y NO un DTO.
+ * Si Spring deserializa el JSON antes de que llegue aquí, la firma
+ * SIEMPRE fallará aunque la clave sea correcta.
+ *
+ * ──────────────────────────────────────────────────────────────────────────
+ *  POLÍTICA DE RESPUESTA
+ * ──────────────────────────────────────────────────────────────────────────
+ * · Firma inválida       → 400 Bad Request  (Stripe no reintenta errores 4xx)
+ * · Error de negocio     → 200 OK           (evita reintentos innecesarios de Stripe)
+ * · Error inesperado     → 200 OK           (ídem; el error queda en los logs)
+ *
+ * Stripe reintenta las notificaciones que reciben 5xx durante hasta 3 días,
+ * por eso los errores internos se absorben y logean sin propagar al caller.
+ *
+ * Endpoint: POST /api/payments/webhook/stripe
  */
 @RestController
 @RequestMapping("/api/payments/webhook")
@@ -37,91 +52,31 @@ public class WebhookController {
 
     private final PaymentService paymentService;
 
-    @Value("${mercadopago.webhook-secret}")
-    private String webhookSecret;
+    @PostMapping(value = "/stripe", consumes = MediaType.APPLICATION_JSON_VALUE)
+    public ResponseEntity<Void> handleStripeWebhook(
+            @RequestBody String payload,
+            @RequestHeader("Stripe-Signature") String stripeSignature) {
 
-    /**
-     * Endpoint de webhook para MercadoPago.
-     *
-     * MercadoPago espera un 200 OK rápido; si tarda más de 22 segundos reintentará.
-     * Por eso el procesamiento real se delega al PaymentService y respondemos de inmediato.
-     */
-    @PostMapping("/mercadopago")
-    public ResponseEntity<Void> handleMercadoPagoWebhook(
-            @RequestBody WebhookNotification notification,
-            @RequestHeader(value = "x-signature",    required = false) String xSignature,
-            @RequestHeader(value = "x-request-id",   required = false) String xRequestId) {
+        log.info("[Webhook] Notificación recibida de Stripe ({} bytes)", payload.length());
 
-        log.info("[Webhook] Notificación recibida — type={} action={} dataId={}",
-                notification.getType(), notification.getAction(),
-                notification.getData() != null ? notification.getData().getId() : "null");
-
-        // Validar firma HMAC (desactívala en sandbox local si MP no puede alcanzar tu servidor)
-        if (xSignature != null && !isValidSignature(xSignature, xRequestId, notification)) {
-            log.warn("[Webhook] Firma inválida — posible llamada no autorizada");
-            return ResponseEntity.status(HttpStatus.UNAUTHORIZED).build();
-        }
-
-        // Responder 200 inmediatamente a MercadoPago para que no reintente
-        // El procesamiento real puede demorar (consulta a la API de MP, BD, etc.)
         try {
-            paymentService.processWebhook(notification);
+            paymentService.processWebhook(payload, stripeSignature);
+
+        } catch (ResponseStatusException e) {
+            // Re-lanzar errores 4xx (firma inválida, payload malformado).
+            // Stripe interpreta el 4xx como "no reintentar" — es el comportamiento correcto.
+            if (e.getStatusCode().is4xxClientError()) {
+                log.warn("[Webhook] Petición rechazada ({}) — {}", e.getStatusCode(), e.getReason());
+                throw e;
+            }
+            // Errores 5xx de negocio: loguear y devolver 200 para evitar reintentos.
+            log.error("[Webhook] Error de servicio al procesar notificación: {}", e.getMessage(), e);
+
         } catch (Exception e) {
-            // Logueamos el error pero nunca devolvemos 5xx al webhook de MP
-            // (si devolvemos error, MP reintentará indefinidamente)
-            log.error("[Webhook] Error procesando notificación: {}", e.getMessage(), e);
+            // Error inesperado: loguear y devolver 200 para evitar reintentos.
+            log.error("[Webhook] Error inesperado al procesar notificación: {}", e.getMessage(), e);
         }
 
         return ResponseEntity.ok().build();
-    }
-
-    /**
-     * Valida la firma HMAC-SHA256 que MercadoPago incluye en x-signature.
-     *
-     * Formato de x-signature: "ts=1704067200,v1=abc123def456..."
-     * Mensaje a firmar:       "id:{dataId};request-id:{xRequestId};ts:{timestamp};"
-     */
-    private boolean isValidSignature(String xSignature, String xRequestId,
-                                     WebhookNotification notification) {
-        try {
-            // Parsear ts y v1 de la cabecera x-signature
-            String timestamp = null;
-            String receivedHmac = null;
-
-            for (String part : xSignature.split(",")) {
-                String[] kv = part.trim().split("=", 2);
-                if (kv.length == 2) {
-                    if ("ts".equals(kv[0]))   timestamp    = kv[1];
-                    if ("v1".equals(kv[0]))   receivedHmac = kv[1];
-                }
-            }
-
-            if (timestamp == null || receivedHmac == null) {
-                log.warn("[Webhook] Cabecera x-signature mal formada: {}", xSignature);
-                return false;
-            }
-
-            // Construir el mensaje a verificar
-            String dataId = notification.getData() != null ? notification.getData().getId() : "";
-            String manifest = "id:" + dataId + ";"
-                    + "request-id:" + (xRequestId != null ? xRequestId : "") + ";"
-                    + "ts:" + timestamp + ";";
-
-            // Calcular HMAC-SHA256
-            Mac mac = Mac.getInstance("HmacSHA256");
-            mac.init(new SecretKeySpec(webhookSecret.getBytes(StandardCharsets.UTF_8), "HmacSHA256"));
-            byte[] computedBytes = mac.doFinal(manifest.getBytes(StandardCharsets.UTF_8));
-            String computedHmac = HexFormat.of().formatHex(computedBytes);
-
-            boolean valid = computedHmac.equalsIgnoreCase(receivedHmac);
-            if (!valid) {
-                log.warn("[Webhook] HMAC no coincide — esperado: {} recibido: {}", computedHmac, receivedHmac);
-            }
-            return valid;
-
-        } catch (Exception e) {
-            log.error("[Webhook] Error validando firma: {}", e.getMessage());
-            return false;
-        }
     }
 }

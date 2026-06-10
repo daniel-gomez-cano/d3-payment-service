@@ -23,4 +23,6 @@ public interface PaymentRepository extends JpaRepository<Payment, String> {
 
     /** Todos los pagos de un comprador con un estado específico. */
     List<Payment> findByBuyerIdAndStatus(String buyerId, PaymentStatus status);
+
+    Optional<Payment> findByPaymentIntentId(String paymentIntentId);
 }

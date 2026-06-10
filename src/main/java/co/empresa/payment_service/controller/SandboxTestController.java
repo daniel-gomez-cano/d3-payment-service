@@ -1,9 +1,8 @@
 package co.empresa.payment_service.controller;
 
-import com.mercadopago.client.preference.PreferenceClient;
-import com.mercadopago.client.preference.PreferenceItemRequest;
-import com.mercadopago.client.preference.PreferenceRequest;
-import com.mercadopago.resources.preference.Preference;
+import com.stripe.exception.StripeException;
+import com.stripe.model.checkout.Session;
+import com.stripe.param.checkout.SessionCreateParams;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.web.bind.annotation.GetMapping;
@@ -12,138 +11,151 @@ import org.springframework.web.bind.annotation.RestController;
 
 import java.math.BigDecimal;
 import java.time.LocalDateTime;
-import java.util.List;
 import java.util.Map;
 
 /**
- * ⚠️ CONTROLADOR TEMPORAL DE PRUEBA — SOLO PARA DESARROLLO/SANDBOX
+ * Controlador de pruebas para verificar la integración con Stripe en modo test.
  *
- * Permite verificar que la integración con MercadoPago funciona correctamente
- * sin necesitar el order-service, event-service ni ticket-service corriendo.
+ * ⚠️  Solo debe estar activo en entornos de desarrollo y staging.
+ *     En producción, protege o elimina estos endpoints (p.ej. con @Profile("!prod")).
  *
- * Endpoint: GET /sandbox/test-mercadopago
- * No requiere JWT — accesible directo desde el navegador o curl.
+ * Base path: /sandbox
  *
- * ELIMINAR o comentar antes de entregar/desplegar en producción.
+ * GET /sandbox/check-config   → verifica que las variables de Stripe estén cargadas
+ * GET /sandbox/test-stripe    → crea una Checkout Session de prueba real en Stripe Test Mode
  */
 @RestController
 @RequestMapping("/sandbox")
 @Slf4j
 public class SandboxTestController {
 
-    @Value("${mercadopago.sandbox:true}")
-    private boolean sandbox;
+    @Value("${stripe.secret-key}")
+    private String stripeSecretKey;
 
-    @Value("${mercadopago.notification-url}")
-    private String notificationUrl;
+    @Value("${stripe.success-url}")
+    private String successUrl;
 
-    @Value("${mercadopago.back-url.success}")
-    private String backUrlSuccess;
-
-    @Value("${mercadopago.back-url.failure}")
-    private String backUrlFailure;
-
-    @Value("${mercadopago.back-url.pending}")
-    private String backUrlPending;
-
-    @GetMapping("/check-config")
-        public Map<String, Object> checkConfig(
-                @Value("${mercadopago.access-token}") String token) {
-        return Map.of(
-                "tokenLength", token.length(),
-                "tokenStart", token.substring(0, Math.min(20, token.length())),
-                "tokenEnd", token.substring(Math.max(0, token.length() - 10)),
-                "sandbox", sandbox
-        );
-        }
+    @Value("${stripe.cancel-url}")
+    private String cancelUrl;
 
     /**
-     * Crea una preferencia de pago real en MercadoPago con datos de prueba
-     * y devuelve la URL del checkout sandbox.
-     *
-     * Cómo usarlo:
-     *   1. Abre http://localhost:8084/sandbox/test-mercadopago en el navegador
-     *   2. Verás un JSON con paymentUrl — ábrelo
-     *   3. Usa las tarjetas de prueba de MercadoPago para simular el pago
+     * Verifica que las variables de entorno de Stripe estén cargadas correctamente.
+     * No expone la clave completa — solo muestra el modo y los primeros caracteres.
      */
-    @GetMapping("/test-mercadopago")
-    public Map<String, Object> testMercadoPago() {
+    @GetMapping("/check-config")
+    public Map<String, Object> checkConfig() {
+        boolean isTestMode = stripeSecretKey.startsWith("sk_test_");
+        boolean isLiveMode = stripeSecretKey.startsWith("sk_live_");
+
+        return Map.of(
+                "stripeMode",  isTestMode ? "TEST ✓" : isLiveMode ? "LIVE ⚠️" : "DESCONOCIDO ✗",
+                "keyLength",   stripeSecretKey.length(),
+                "keyPrefix",   stripeSecretKey.substring(0, Math.min(12, stripeSecretKey.length())),
+                "successUrl",  successUrl,
+                "cancelUrl",   cancelUrl,
+                "advertencia", isLiveMode
+                        ? "⚠️  Estás usando claves LIVE — los cargos serán reales"
+                        : isTestMode ? "OK — modo test, sin cargos reales" : "Verifica el formato de tu clave",
+                "timestamp",   LocalDateTime.now().toString()
+        );
+    }
+
+    /**
+     * Crea una Checkout Session de prueba real en Stripe Test Mode.
+     * Requiere que STRIPE_SECRET_KEY sea una clave sk_test_... — no hace cargos reales.
+     *
+     * Flujo de prueba:
+     *  1. Llama a GET /sandbox/test-stripe.
+     *  2. Copia el valor de "sessionUrl" de la respuesta y ábrelo en el navegador.
+     *  3. Ingresa los datos de una tarjeta de prueba (ver campo "tarjetas_de_prueba").
+     *  4. Stripe redirigirá al successUrl configurado en application.yml.
+     *  5. Verifica que el webhook (checkout.session.completed) llegue al servicio.
+     */
+    @GetMapping("/test-stripe")
+    public Map<String, Object> testStripe() {
         try {
-            log.info("[SandboxTest] Creando preferencia de prueba en MercadoPago...");
+            log.info("[SandboxTest] Creando sesión de Stripe Checkout de prueba...");
 
-            // Ítem de prueba simulando una boleta de VivaEventos
-            PreferenceItemRequest item = PreferenceItemRequest.builder()
-                    .id("BOLETA-TEST-001")
-                    .title("Boleta Prueba — Concierto VivaEventos")
-                    .description("Boleta de prueba para verificar integración MercadoPago")
-                    .quantity(2)
-                    .unitPrice(new BigDecimal("15000"))
-                    .currencyId("COP")
+            // Simulamos 2 boletas a $15.000 COP c/u = $30.000 COP total
+            // Stripe recibe el monto en centavos: 15000 * 100 = 1.500.000
+            long unitAmountCentavos = new BigDecimal("15000")
+                    .multiply(BigDecimal.valueOf(100))
+                    .longValue();
+
+            SessionCreateParams params = SessionCreateParams.builder()
+                    .setMode(SessionCreateParams.Mode.PAYMENT)
+                    .addLineItem(
+                            SessionCreateParams.LineItem.builder()
+                                    .setQuantity(2L)
+                                    .setPriceData(
+                                            SessionCreateParams.LineItem.PriceData.builder()
+                                                    .setCurrency("cop")
+                                                    .setUnitAmount(unitAmountCentavos)
+                                                    .setProductData(
+                                                            SessionCreateParams.LineItem.PriceData
+                                                                    .ProductData.builder()
+                                                                    .setName("Boleta Prueba — Concierto VivaEventos")
+                                                                    .setDescription("Boleta de prueba para verificar integración Stripe")
+                                                                    .build())
+                                                    .build())
+                                    .build())
+                    .setSuccessUrl(successUrl)
+                    .setCancelUrl(cancelUrl)
+                    .putMetadata("cartId", "SANDBOX-TEST-" + System.currentTimeMillis())
                     .build();
 
-            // NOTA: En esta prueba NO incluimos notificationUrl (webhook) ni backUrls
-            // para aislar la prueba y evitar que una URL de ngrok expirada cause el fallo.
-            // La integración completa con webhook se prueba cuando el flujo end-to-end esté listo.
-            PreferenceRequest preferenceReq = PreferenceRequest.builder()
-                    .items(List.of(item))
-                    .externalReference("SANDBOX-TEST-" + System.currentTimeMillis())
-                    .build();
+            Session session = Session.create(params);
 
-            PreferenceClient client = new PreferenceClient();
-            Preference preference = client.create(preferenceReq);
-
-            String paymentUrl = sandbox
-                    ? preference.getSandboxInitPoint()
-                    : preference.getInitPoint();
-
-            log.info("[SandboxTest] Preferencia creada exitosamente — ID: {}", preference.getId());
+            log.info("[SandboxTest] Sesión creada exitosamente — sessionId: {}", session.getId());
 
             return Map.of(
-                    "status", "OK",
-                    "mensaje", "Preferencia creada exitosamente en MercadoPago",
-                    "sandboxMode", sandbox,
-                    "preferenceId", preference.getId(),
-                    "paymentUrl", paymentUrl,
-                    "totalCOP", "30000",
-                    "instrucciones", Map.of(
-                            "paso1", "Copia el paymentUrl y ábrelo en el navegador",
-                            "paso2", "Inicia sesión con tu cuenta de prueba COMPRADOR de MercadoPago",
-                            "paso3", "Usa una tarjeta de prueba para simular el pago",
-                            "tarjetaAprobada", "4509 9535 6623 3704 — CVV: 123 — Venc: 11/25 — Nombre: APRO",
-                            "tarjetaRechazada", "4000 0000 0000 0002 — CVV: 123 — Venc: 11/25 — Nombre: OTHE",
-                            "referencia", "https://www.mercadopago.com.co/developers/es/docs/your-integrations/test/cards"
+                    "status",     "OK",
+                    "mensaje",    "Sesión de Stripe Checkout creada exitosamente en modo TEST",
+                    "sessionId",  session.getId(),       // cs_test_...
+                    "sessionUrl", session.getUrl(),       // URL a abrir en el navegador
+                    "totalCOP",   "30.000 (2 boletas × $15.000)",
+                    "expira",     "en 24 horas (comportamiento por defecto de Stripe)",
+                    "tarjetas_de_prueba", Map.of(
+                            "visa_aprobada",        "4242 4242 4242 4242",
+                            "visa_declinada",       "4000 0000 0000 0002  →  charge_failed",
+                            "fondos_insuficientes", "4000 0000 0000 9995  →  insufficient_funds",
+                            "requiere_3ds",         "4000 0025 0000 3155  →  simula autenticación adicional",
+                            "datos_comunes",        "CVV: cualquier 3 dígitos | Fecha: cualquier mes/año futuro | Nombre: cualquier texto",
+                            "referencia",           "https://docs.stripe.com/testing#cards"
                     ),
-                    "timestamp", LocalDateTime.now().toString()
+                    "timestamp",  LocalDateTime.now().toString()
             );
 
-        } catch (com.mercadopago.exceptions.MPApiException e) {
-            // Loguear y devolver la respuesta REAL de MercadoPago (status HTTP + body)
-            String mpResponseBody = e.getApiResponse() != null
-                    ? e.getApiResponse().getContent()
-                    : "sin respuesta";
-            int mpStatusCode = e.getApiResponse() != null
-                    ? e.getApiResponse().getStatusCode()
-                    : -1;
+        } catch (StripeException e) {
+            log.error("[SandboxTest] Error de Stripe — código: {} mensaje: {}",
+                    e.getCode(), e.getMessage());
 
-            log.error("[SandboxTest] Error de API MercadoPago — HTTP {}: {}", mpStatusCode, mpResponseBody);
+            String diagnostico;
+            String code = e.getCode() != null ? e.getCode() : "";
+            if (code.contains("authentication") || (e.getMessage() != null && e.getMessage().contains("No API key"))) {
+                diagnostico = "Clave inválida — verifica STRIPE_SECRET_KEY en tu .env o en el Secret de K8s";
+            } else if (code.equals("api_key_expired")) {
+                diagnostico = "La clave de Stripe ha expirado — genera una nueva en el Dashboard";
+            } else if (e.getStatusCode() == 401) {
+                diagnostico = "Autenticación fallida — asegúrate de usar sk_test_... para pruebas";
+            } else {
+                diagnostico = "Error de Stripe — revisa el mensaje y el Dashboard en modo Test";
+            }
 
             return Map.of(
-                    "status", "ERROR_MP_API",
-                    "httpStatus", mpStatusCode,
-                    "mensajeMP", mpResponseBody,
-                    "diagnostico", mpStatusCode == 401
-                            ? "Token inválido — verifica MP_ACCESS_TOKEN en tu .env"
-                            : mpStatusCode == 400
-                            ? "Solicitud inválida — revisa los datos enviados a MercadoPago"
-                            : "Error de MercadoPago — revisa mensajeMP para el detalle",
-                    "timestamp", LocalDateTime.now().toString()
+                    "status",      "ERROR_STRIPE",
+                    "stripeCode",  code.isEmpty() ? "desconocido" : code,
+                    "httpStatus",  e.getStatusCode(),
+                    "mensaje",     e.getMessage() != null ? e.getMessage() : "sin mensaje",
+                    "diagnostico", diagnostico,
+                    "timestamp",   LocalDateTime.now().toString()
             );
 
         } catch (Exception e) {
             log.error("[SandboxTest] Error inesperado: {}", e.getMessage(), e);
             return Map.of(
-                    "status", "ERROR",
-                    "mensaje", e.getMessage(),
+                    "status",    "ERROR",
+                    "mensaje",   e.getMessage() != null ? e.getMessage() : "error desconocido",
                     "timestamp", LocalDateTime.now().toString()
             );
         }
