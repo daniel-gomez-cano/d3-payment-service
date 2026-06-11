@@ -340,13 +340,18 @@ public class PaymentService {
     }
 
     private void handleSessionCompleted(Event event) {
-        Session session = (Session) event.getDataObjectDeserializer()
-                .getObject()
-                .orElseThrow(() -> new ResponseStatusException(HttpStatus.BAD_REQUEST,
-                        "No se pudo deserializar el evento checkout.session.completed"));
+        Session session;
+        try {
+            session = (Session) event.getDataObjectDeserializer()
+                    .deserializeUnsafe();
+        } catch (Exception e) {
+            log.error("[Webhook] No se pudo deserializar checkout.session.completed: {}", e.getMessage());
+            throw new ResponseStatusException(HttpStatus.BAD_REQUEST,
+                    "No se pudo deserializar el evento checkout.session.completed");
+        }
 
         String cartId          = session.getMetadata().get("cartId");
-        String paymentIntentId = session.getPaymentIntent(); // pi_... necesario para reembolsos
+        String paymentIntentId = session.getPaymentIntent();
 
         Payment payment = paymentRepo.findByCartId(cartId).orElse(null);
         if (payment == null) {
@@ -359,8 +364,8 @@ public class PaymentService {
         }
 
         PaymentStatus previousStatus = payment.getStatus();
-        payment.setStripeSessionId(session.getId());      // actualiza por si acaso (idempotente)
-        payment.setPaymentIntentId(paymentIntentId);      // pi_... guardado para reembolsos futuros
+        payment.setStripeSessionId(session.getId());
+        payment.setPaymentIntentId(paymentIntentId);
         payment.setStatus(PaymentStatus.APPROVED);
         payment.setPaidAt(LocalDateTime.now());
         paymentRepo.save(payment);
@@ -375,21 +380,27 @@ public class PaymentService {
     }
 
     private void handleSessionExpired(Event event) {
-        Session session = (Session) event.getDataObjectDeserializer()
-                .getObject().orElse(null);
-        if (session == null) return;
+        Session session;
+        try {
+            session = (Session) event.getDataObjectDeserializer().deserializeUnsafe();
+        } catch (Exception e) {
+            log.error("[Webhook] No se pudo deserializar checkout.session.expired: {}", e.getMessage());
+            return;
+        }
 
         String cartId = session.getMetadata().get("cartId");
         updateToFailedStatus(cartId, "La sesión de pago expiró sin completarse");
     }
 
     private void handlePaymentFailed(Event event) {
-        PaymentIntent pi = (PaymentIntent) event.getDataObjectDeserializer()
-                .getObject().orElse(null);
-        if (pi == null) return;
+        PaymentIntent pi;
+        try {
+            pi = (PaymentIntent) event.getDataObjectDeserializer().deserializeUnsafe();
+        } catch (Exception e) {
+            log.error("[Webhook] No se pudo deserializar payment_intent.payment_failed: {}", e.getMessage());
+            return;
+        }
 
-        // Buscamos por paymentIntentId (guardado en handleSessionCompleted si el intento
-        // existía antes de fallar) o ignoramos si aún no tenemos registro.
         paymentRepo.findByPaymentIntentId(pi.getId()).ifPresent(payment ->
                 updatePaymentStatus(payment, PaymentStatus.REJECTED,
                         pi.getLastPaymentError() != null
