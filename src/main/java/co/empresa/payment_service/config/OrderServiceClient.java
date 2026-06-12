@@ -149,6 +149,7 @@ public class OrderServiceClient {
     public record CartSummaryInternal(
             String cartId,
             String buyerId,
+            String buyerEmail,
             BigDecimal total,
             String currency,
             List<ItemSummary> items

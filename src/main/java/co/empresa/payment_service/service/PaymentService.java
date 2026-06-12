@@ -114,6 +114,7 @@ public class PaymentService {
             payment = paymentRepo.save(Payment.builder()
                     .cartId(cartId)
                     .buyerId(buyerId)
+                    .buyerEmail(cart.buyerEmail())
                     .stripeSessionId(session.getId())   // cs_test_... / cs_live_...
                     .idempotencyKey(idempotencyKey)
                     .amount(cart.total())
@@ -170,6 +171,7 @@ public class PaymentService {
             payment = paymentRepo.save(Payment.builder()
                     .cartId(cartId)
                     .buyerId(event.getBuyerId())
+                    .buyerEmail(event.getBuyerEmail())
                     .stripeSessionId(session.getId())   // cs_test_... / cs_live_...
                     .idempotencyKey(cartId)
                     .amount(event.getTotal())
@@ -502,6 +504,7 @@ public class PaymentService {
                 .cartId(payment.getCartId())
                 .paymentId(payment.getId())
                 .buyerId(payment.getBuyerId())
+                .buyerEmail(payment.getBuyerEmail())
                 .status(payment.getStatus().name())
                 .amount(payment.getAmount())
                 .statusDetail(statusDetail)

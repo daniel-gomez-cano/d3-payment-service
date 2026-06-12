@@ -41,6 +41,9 @@ public class Payment {
     @Column(name = "buyer_id", nullable = false)
     private String buyerId;
 
+    @Column(name = "buyer_email")
+    private String buyerEmail;  // ← agregar esto
+
     // -------- Stripe --------
 
     /**
