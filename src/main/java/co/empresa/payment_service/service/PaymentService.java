@@ -242,14 +242,24 @@ public class PaymentService {
 
     /**
      * Construye y envía el SessionCreateParams a la API de Stripe.
-     * La correlación con el webhook se hace mediante metadata.cartId.
+     *
+     * La successUrl se construye reemplazando CART_ID_PLACEHOLDER con el cartId real,
+     * de modo que Stripe redirija al frontend con ?cart_id=<cartId> ya incluido.
+     *
+     * Ejemplo de stripe.success-url en application.yml / k8s:
+     *   http://localhost:8084/payment-success?cart_id=CART_ID_PLACEHOLDER&session_id={CHECKOUT_SESSION_ID}
+     *
+     * Stripe reemplaza {CHECKOUT_SESSION_ID} automáticamente al redirigir.
+     * Este método reemplaza CART_ID_PLACEHOLDER con el cartId real antes de enviarlo.
      */
     private Session buildStripeSession(String cartId, BigDecimal total,
                                        String description) throws StripeException {
 
-        // Stripe recibe el monto en la unidad mínima de la moneda.
-        // COP usa centavos (×100), igual que USD o EUR.
         long unitAmountCentavos = total.multiply(BigDecimal.valueOf(100)).longValue();
+
+        // ── Inyectar el cartId real en la success URL ──────────────
+        String resolvedSuccessUrl = successUrl.replace("CART_ID_PLACEHOLDER", cartId);
+        // ────────────────────────────────────────────────────────────────
 
         SessionCreateParams params = SessionCreateParams.builder()
                 .setMode(SessionCreateParams.Mode.PAYMENT)
@@ -267,9 +277,9 @@ public class PaymentService {
                                                                 .build())
                                                 .build())
                                 .build())
-                .setSuccessUrl(successUrl)   // incluye {CHECKOUT_SESSION_ID} si se necesita en el frontend
+                .setSuccessUrl(resolvedSuccessUrl)   // ← URL con cart_id ya resuelto
                 .setCancelUrl(cancelUrl)
-                .putMetadata("cartId", cartId) // clave de correlación para el webhook
+                .putMetadata("cartId", cartId)       // correlación para el webhook
                 .build();
 
         return Session.create(params);
@@ -344,8 +354,7 @@ public class PaymentService {
     private void handleSessionCompleted(Event event) {
         Session session;
         try {
-            session = (Session) event.getDataObjectDeserializer()
-                    .deserializeUnsafe();
+            session = (Session) event.getDataObjectDeserializer().deserializeUnsafe();
         } catch (Exception e) {
             log.error("[Webhook] No se pudo deserializar checkout.session.completed: {}", e.getMessage());
             throw new ResponseStatusException(HttpStatus.BAD_REQUEST,
@@ -512,8 +521,8 @@ public class PaymentService {
                 .build();
 
         rabbitTemplate.convertAndSend(
-                RabbitMQConfig.PAYMENT_EXCHANGE,    // "payment.exchange"
-                RabbitMQConfig.PAYMENT_RESULT_KEY,  // "payment.result"
+                RabbitMQConfig.PAYMENT_EXCHANGE,
+                RabbitMQConfig.PAYMENT_RESULT_KEY,
                 event);
 
         log.info("[RabbitMQ] → PaymentResultEvent publicado — cartId={} status={}",
