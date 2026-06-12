@@ -27,6 +27,8 @@ public class PaymentResultEvent {
     /** sub de Keycloak del comprador */
     private String buyerId;
 
+    private String buyerEmail;
+
     /**
      * Estado del pago.
      * Valores posibles: APPROVED, REJECTED, FAILED, PENDING, REFUNDED
